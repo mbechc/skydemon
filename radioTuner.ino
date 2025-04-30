@@ -1,215 +1,225 @@
 /*
-   M5Stack Atom Lite (M5 C008) with Atom RS232 (M5 K046)
-   
-   Hardware Configuration:
-     - BLE & WiFi AP functionality are provided.
-     - RS232 communication uses a secondary hardware serial port (Serial2).
-     - RS232 configuration for this combo:
-         RS232_BAUD:   9600 baud
-         RS232_RX_PIN: G22  (pin number 22)
-         RS232_TX_PIN: G19  (pin number 19)
-   
-   Functionality:
-     - All system events (BLE connection, BLE data reception, WiFi client events) 
-       are logged into an in‑memory log buffer (logBuffer). No log messages are auto‑printed.
-     - A web server (running on the WiFi AP) displays the log buffer and includes a link to clear it.
-     - A serial menu is printed every 5 seconds on the Serial monitor to allow:
-         (R)ead log – prints the current log buffer,
-         (C)lear log – clears the log buffer.
-     - Data received via BLE is written out on RS232.
-   
-   Adjust any of the defined constants below as needed.
+  radioTuner: M5Stack Atom Lite + Atom RS232
+
+  Features:
+    • BLE UART: logs connect/disconnect & incoming data
+    • RS232 (Serial2) echo & logging (RX pin G22, TX pin G19, 9600 baud)
+    • WiFi AP only (SSID = DEVICE_NAME) hosting HTTP:
+        – GET /                → list of stored logs with download links
+        – GET /download?file   → download log as "radioTuner_<name>.txt"
+    • Per-boot logs in SPIFFS (/log_<cycle>.txt), retain latest 5
+    • Millisecond-precision timestamps: <sec>.<msec> "SRC" "MSG"
+    • Real-time Serial output of every log entry
+
+  On future reference, “radioTuner” refers to this complete feature set.
 */
 
+#include <FS.h>
+#include <SPIFFS.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
 #include <WiFi.h>
-#include <WebServer.h>
 
-// ----- CONFIGURATION -----
-#define ENABLE_AP 1              // Set to 1 to enable the WiFi AP, 0 to disable it.
-const char* DEVICE_NAME = "radioTuner";  // Used as BLE device name and WiFi AP SSID.
+#define DEVICE_NAME    "radioTuner"
+#define RS232_BAUD     9600
+#define RS232_RX_PIN   22
+#define RS232_TX_PIN   19
+#define SERVICE_UUID   "0000ffe0-0000-1000-8000-00805f9b34fb"
+#define CHAR_UUID      "0000ffe1-0000-1000-8000-00805f9b34fb"
+#define MAX_LOG_FILES  5
 
-// RS232 configuration (for Atom RS232 module on M5Stack Atom Lite)
-#define RS232_BAUD 9600
-#define RS232_RX_PIN 22          // RS232 RX is on pin G22
-#define RS232_TX_PIN 19          // RS232 TX is on pin G19
-
-// BLE UART UUIDs
-#define SERVICE_UUID        "0000ffe0-0000-1000-8000-00805f9b34fb"
-#define CHARACTERISTIC_UUID "0000ffe1-0000-1000-8000-00805f9b34fb"
-
-// ----- GLOBAL VARIABLES -----
-String logBuffer = "";  // In-memory log buffer
-
-// Create a web server on port 80.
-WebServer server(80);
-
-// Create RS232 instance on HardwareSerial port 2.
+// Globals
+String logBuffer;
+WiFiServer wifiServer(80);
 HardwareSerial RS232(2);
-
-// Logging function: Append messages to logBuffer.
-void logMessage(const String &message) {
-  logBuffer += message + "\n";
-}
-
-// Serial menu: Displays available commands.
-void printMenu() {
-  Serial.println("\nSerial Menu: (R)ead log, (C)lear log");
-  Serial.print(">");
-}
-
-// ----- BLE GLOBAL OBJECTS -----
 BLECharacteristic* pCharacteristic;
-BLEServer* pServer;
-bool deviceConnected = false;
+BLEServer*        pServer;
+bool              deviceConnected = false;
+unsigned long     bootMillis;
+uint32_t          cycleId;
+String            logFilename;
 
-// ----- BLE CALLBACKS -----
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) override {
-    deviceConnected = true;
-    logMessage("[BLE] Device connected");
+// Append timestamped entry, print to Serial, buffer, and SPIFFS
+void appendLog(const String &src, const String &msg) {
+  unsigned long d = millis() - bootMillis;
+  unsigned long s = d / 1000;
+  unsigned long ms = d % 1000;
+  char ts[16];
+  snprintf(ts, sizeof(ts), "%lu.%03lu", s, ms);
+  String line = String(ts) + " " + src + " \"" + msg + "\"\r\n";
+  // Real-time Serial
+  Serial.print(line);
+  // In-memory tail
+  logBuffer += line;
+  if (logBuffer.length() > 4096) logBuffer = logBuffer.substring(logBuffer.length() - 4096);
+  // SPIFFS
+  File f = SPIFFS.open(logFilename, FILE_APPEND);
+  if (f) { f.print(line); f.close(); }
+}
+
+// Keep only the last MAX_LOG_FILES logs
+void pruneOldLogs() {
+  std::map<uint32_t, String> files;
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    String name = file.name();
+    if (name.startsWith("/log_") && name.endsWith(".txt")) {
+      uint32_t id = name.substring(5, name.indexOf('.', 5)).toInt();
+      files[id] = name;
+    }
+    file.close();
+    file = root.openNextFile();
   }
-  void onDisconnect(BLEServer* pServer) override {
+  while (files.size() > MAX_LOG_FILES) {
+    auto it = files.begin();
+    SPIFFS.remove(it->second);
+    files.erase(it);
+  }
+}
+
+// BLE server callbacks
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override {
+    deviceConnected = true;
+    appendLog("BLE", "Connected");
+  }
+  void onDisconnect(BLEServer* s) override {
     deviceConnected = false;
-    logMessage("[BLE] Device disconnected");
-    pServer->getAdvertising()->start();
-    logMessage("[BLE] Advertising restarted");
+    appendLog("BLE", "Disconnected");
+    s->getAdvertising()->start();
+    appendLog("BLE", "Advertising");
   }
 };
-
-class MyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pCharacteristic) override {
-    String rx = pCharacteristic->getValue();
-    if (rx.length() > 0) {
-      logMessage("[BLE] Received: " + rx);
-      // Write the received BLE data to the RS232 port.
+class CharCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* ch) override {
+    String rx = ch->getValue();
+    if (rx.length()) {
+      appendLog("BLE", rx);
       RS232.write((const uint8_t*)rx.c_str(), rx.length());
     }
   }
 };
 
-#if ENABLE_AP
-// ----- WiFi EVENT HANDLER -----
-// Logs WiFi client connection/disconnection events.
-void WiFiEvent(WiFiEvent_t event) {
-  switch(event) {
-    case WIFI_EVENT_AP_STACONNECTED:
-      logMessage("[WiFi] Client connected");
-      break;
-    case WIFI_EVENT_AP_STADISCONNECTED:
-      logMessage("[WiFi] Client disconnected");
-      break;
-    default:
-      break;
-  }
-}
-#endif
-
-// ----- WEB SERVER HANDLERS -----
-// Handles the root URL: displays the log buffer and a link to clear it.
-void handleRoot() {
-  String html = "<html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='5'><title>Log Buffer</title></head><body>";
-  html += "<h1>Log Buffer</h1><pre>" + logBuffer + "</pre>";
-  html += "<p><a href=\"/clear\">Clear Log</a></p>";
-  html += "</body></html>";
-  server.send(200, "text/html", html);
+// WiFi AP client events
+void WiFiEvent(WiFiEvent_t e) {
+  if (e == WIFI_EVENT_AP_STACONNECTED)      appendLog("WIFI", "Client connected");
+  else if (e == WIFI_EVENT_AP_STADISCONNECTED) appendLog("WIFI", "Client disconnected");
 }
 
-// Clears the log buffer and redirects back to the root page.
-void handleClear() {
-  logBuffer = "";
-  server.sendHeader("Location", "/", true);
-  server.send(302, "text/plain", "");
-}
-
-// Global timer for printing the serial menu.
-unsigned long lastMenuPrint = 0;
-const unsigned long menuInterval = 5000; // 5 seconds
-
-// ----- SETUP -----
 void setup() {
-  // Start Serial (for menu interaction) at 115200 baud.
   Serial.begin(115200);
-  delay(500);
-  logMessage("=== radioTuner BLE UART with Log Buffer and RS232 ===");
+  delay(200);
 
-  // Initialize RS232 with defined baud rate and pins.
+  // SPIFFS mount and prune
+  SPIFFS.begin(true);
+  pruneOldLogs();
+
+  // Cycle file
+  File cf = SPIFFS.open("/cycle.txt", "r");
+  cycleId = cf ? cf.parseInt() : 0;
+  if (cf) cf.close();
+  cycleId++;
+  cf = SPIFFS.open("/cycle.txt", "w"); cf.println(cycleId); cf.close();
+  logFilename = "/log_" + String(cycleId) + ".txt";
+  bootMillis = millis();
+  appendLog("SYSTEM", "Boot cycle=" + String(cycleId));
+
+  // RS232 init
   RS232.begin(RS232_BAUD, SERIAL_8N1, RS232_RX_PIN, RS232_TX_PIN);
-  logMessage("RS232 started on pins RX: " + String(RS232_RX_PIN) + ", TX: " + String(RS232_TX_PIN));
+  appendLog("SYSTEM", "RS232@" + String(RS232_BAUD));
 
-#if ENABLE_AP
-  logMessage("Starting WiFi AP...");
+  // WiFi AP
   WiFi.softAP(DEVICE_NAME);
   WiFi.onEvent(WiFiEvent);
-  IPAddress IP = WiFi.softAPIP();
-  logMessage("AP started with IP: " + IP.toString());
+  appendLog("WIFI", "AP @" + WiFi.softAPIP().toString());
+  wifiServer.begin();
+  appendLog("SYSTEM", "HTTP started");
 
-  // Setup web server routes.
-  server.on("/", handleRoot);
-  server.on("/clear", handleClear);
-  server.begin();
-  logMessage("[Web] Server started");
-#endif
+  // OTA via AP
+  ArduinoOTA.setHostname(DEVICE_NAME);
+  ArduinoOTA.begin();
+  appendLog("SYSTEM", "OTA Ready");
 
-  // ----- BLE INITIALIZATION -----
+  // BLE init
   BLEDevice::init(DEVICE_NAME);
   pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService* pService = pServer->createService(SERVICE_UUID);
-  pCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ   |
-    BLECharacteristic::PROPERTY_WRITE  |
-    BLECharacteristic::PROPERTY_WRITE_NR |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
+  pServer->setCallbacks(new ServerCallbacks());
+  BLEService* svc = pServer->createService(SERVICE_UUID);
+  pCharacteristic = svc->createCharacteristic(CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY);
   pCharacteristic->addDescriptor(new BLE2902());
-  pCharacteristic->setCallbacks(new MyCallbacks());
-  pCharacteristic->setValue("Hello from ESP32");
-  pService->start();
-
-  BLEAdvertising* pAdvertising = pServer->getAdvertising();
-  BLEAdvertisementData advData;
-  advData.setName(DEVICE_NAME);
-  advData.setCompleteServices(BLEUUID(SERVICE_UUID));
-  pAdvertising->setAdvertisementData(advData);
-  pAdvertising->start();
-  logMessage("[BLE] Advertising as '" + String(DEVICE_NAME) + "'");
-
-  // Print the serial menu immediately.
-  printMenu();
-  lastMenuPrint = millis();
+  pCharacteristic->setCallbacks(new CharCallbacks());
+  pCharacteristic->setValue("Hello");
+  svc->start();
+  auto adv = pServer->getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->start();
+  appendLog("BLE", "Advertising");
 }
 
-// ----- MAIN LOOP -----
 void loop() {
-#if ENABLE_AP
-  server.handleClient();
-#endif
+  // OTA
+  ArduinoOTA.handle();
 
-  // Process serial menu commands.
-  if (Serial.available() > 0) {
-    char cmd = Serial.read();
-    if (cmd == 'R' || cmd == 'r') {
-      Serial.println("\n--- Log Start ---");
-      Serial.println(logBuffer);
-      Serial.println("--- Log End ---");
-      printMenu();
-    } else if (cmd == 'C' || cmd == 'c') {
-      logBuffer = "";
-      Serial.println("\nLog cleared.");
-      printMenu();
+  // RS232 echo & log
+  if (RS232.available()) {
+    String rs;
+    while (RS232.available()) {
+      char b = RS232.read();
+      rs += b;
+      RS232.write(b);
     }
+    appendLog("RS232", rs);
   }
 
-  // Every 5 seconds, re-print the serial menu.
-  if (millis() - lastMenuPrint >= menuInterval) {
-    printMenu();
-    lastMenuPrint = millis();
+  // HTTP handler
+  WiFiClient client = wifiServer.available();
+  if (client) {
+    String req = client.readStringUntil('\r'); client.read();
+    while (client.connected()) {
+      String h = client.readStringUntil('\n');
+      if (h == "\r" || h.length() == 0) break;
+    }
+    if (req.startsWith("GET /download?file=")) {
+      int p1 = req.indexOf('=');
+      int p2 = req.indexOf(' ', p1);
+      String fn = req.substring(p1 + 1, p2);
+      File dl = SPIFFS.open("/" + fn, "r");
+      if (dl) {
+        String out = String("radioTuner_") + fn;
+        client.printf(
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Disposition: attachment; filename=\"%s\"\r\n"
+          "Content-Type: application/octet-stream\r\n"
+          "Content-Length: %u\r\n\r\n",
+          out.c_str(), dl.size()
+        );
+        while (dl.available()) client.write(dl.read());
+        dl.close();
+      } else {
+        client.print("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nFile not found");
+      }
+    } else {
+      client.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+        "<html><body><h1>Stored Logs</h1><ul>"
+      );
+      uint32_t start = (cycleId > MAX_LOG_FILES ? cycleId - MAX_LOG_FILES + 1 : 1);
+      for (uint32_t i = start; i <= cycleId; ++i) {
+        String fn = "log_" + String(i) + ".txt";
+        if (SPIFFS.exists("/" + fn)) {
+          client.print("<li><a href=\"/download?file=" + fn + "\">" + fn + "</a></li>");
+        }
+      }
+      client.print("</ul></body></html>");
+    }
+    delay(1);
+    client.stop();
   }
 
   delay(10);
